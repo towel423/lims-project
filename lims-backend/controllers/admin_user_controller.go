@@ -1,0 +1,1053 @@
+package controllers
+
+import (
+	"backend-school/config"
+	"backend-school/dto"
+	"backend-school/helpers"
+	"backend-school/models"
+	"backend-school/services"
+	"log"
+	"strconv"
+
+	"github.com/gofiber/fiber/v2"
+)
+
+// CasbinRule represents the structure of the casbin_rule table
+
+type LoginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+func GetRPD(c *fiber.Ctx) error {
+	// Ambil username dari konteks (misalnya, disimpan di token JWT)
+	username := c.Locals("username").(string)
+
+	// Dapatkan Casbin enforcer
+	enforcer := helpers.GetCasbinEnforcer()
+
+	// Ambil role yang terkait dengan username
+	roles, err := enforcer.GetRolesForUser(username)
+	if err != nil {
+		log.Printf("Error while fetching roles for user %s: %v", username, err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"statusCode": fiber.StatusInternalServerError,
+			"message":    "Failed to fetch roles for user",
+		})
+	}
+
+	// Pastikan ada role yang diambil
+	if len(roles) == 0 {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"statusCode": fiber.StatusNotFound,
+			"message":    "No roles found for user",
+		})
+	}
+
+	// Ambil data RPD berdasarkan role pertama (atau modifikasi sesuai kebutuhan)
+	role := roles[0] // Menggunakan role pertama
+	var rdpPolicies []models.CasbinRule
+
+	log.Printf("Executing RPD query for role: %s", role)
+	err = config.DB.Model(&models.CasbinRule{}).
+		Where("v0 = ? AND v1 = ? AND v2 = ? AND v3 IS NOT NULL AND v3 != ? AND v4 IS NOT NULL AND v4 != ? AND v5 IS NOT NULL AND v5 != ?",
+			role, "document", "read", "none", "none", "none").
+		Find(&rdpPolicies).Error
+	if err != nil {
+		log.Printf("Error while fetching RPD policies for role %s: %v", role, err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"statusCode": fiber.StatusInternalServerError,
+			"message":    "Failed to fetch RPD policies",
+		})
+	}
+
+	// Buat response untuk RPD
+	var rdp []fiber.Map
+	for _, policy := range rdpPolicies {
+		rdp = append(rdp, fiber.Map{
+			"v1": policy.V1,
+			"v2": policy.V2,
+			"v3": policy.V3,
+			"v4": policy.V4,
+			"v5": policy.V5,
+		})
+	}
+
+	// Kembalikan response dengan RPD
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{
+		"statusCode": fiber.StatusOK,
+		"data":       rdp,
+		"message":    "RPD fetched successfully",
+	})
+}
+
+func Login(c *fiber.Ctx) error {
+	var req LoginRequest
+
+	// Parse the request body
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"statusCode": fiber.StatusBadRequest,
+			"data":       nil,
+			"message":    "Cannot parse JSON",
+		})
+	}
+
+	// Authenticate the user and get the token
+	token, err := services.Login(req.Username, req.Password)
+	if err != nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+			"statusCode": fiber.StatusUnauthorized,
+			"data":       nil,
+			"message":    "Invalid credentials",
+		})
+	}
+
+	// Get Casbin enforcer
+	enforcer := helpers.GetCasbinEnforcer()
+
+	// Fetch roles related to the user
+	roles, err := enforcer.GetRolesForUser(req.Username)
+	if err != nil {
+		log.Printf("Error while fetching roles for user %s: %v", req.Username, err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"statusCode": fiber.StatusInternalServerError,
+			"message":    "Failed to fetch user roles",
+		})
+	}
+
+	// Initialize RDP (read-document-permission) policies
+	var rdpPolicies []models.CasbinRule
+
+	// Fetch RDP policies for each role
+	for _, role := range roles {
+		var roleRdpPolicies []models.CasbinRule
+		log.Printf("Executing RDP query for role: %s", role)
+		err := config.DB.Model(&models.CasbinRule{}).
+			Where("v0 = ? AND v1 = ? AND v2 = ? AND v3 IS NOT NULL AND v4 IS NOT NULL AND v5 IS NOT NULL",
+				role, "document", "view").
+			Find(&roleRdpPolicies).Error
+		if err != nil {
+			log.Printf("Error while fetching RDP policies for role %s: %v", role, err)
+			continue
+		}
+		rdpPolicies = append(rdpPolicies, roleRdpPolicies...)
+	}
+
+	// Prepare RDP response
+	var rdp []fiber.Map
+	for _, policy := range rdpPolicies {
+		rdp = append(rdp, fiber.Map{
+			"v1": policy.V1,
+			"v2": policy.V2,
+			"v3": policy.V3,
+			"v4": policy.V4,
+			"v5": policy.V5,
+		})
+	}
+
+	// Fetch policies directly related to the user
+	userPolicies, err := enforcer.GetFilteredPolicy(0, req.Username)
+	if err != nil {
+		log.Printf("Error while fetching policies for user %s: %v", req.Username, err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"statusCode": fiber.StatusInternalServerError,
+			"message":    "Failed to fetch user policies",
+		})
+	}
+
+	// Fetch role-based policies
+	var rolePolicies [][]string
+	for _, role := range roles {
+		rolePolicy, err := enforcer.GetFilteredPolicy(0, role)
+		if err != nil {
+			log.Printf("Error while fetching policies for role %s: %v", role, err)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"statusCode": fiber.StatusInternalServerError,
+				"message":    "Failed to fetch role policies",
+			})
+		}
+		rolePolicies = append(rolePolicies, rolePolicy...)
+	}
+
+	// Combine both user-specific policies and role-based policies
+	allPolicies := append(userPolicies, rolePolicies...)
+
+	// Extract dynamic permissions
+	permissionMap := make(map[string]fiber.Map)
+	for _, policy := range allPolicies {
+		if len(policy) >= 3 {
+			resource := policy[1]
+			action := policy[2]
+
+			if _, exists := permissionMap[resource]; !exists {
+				permissionMap[resource] = fiber.Map{
+					"rule_policy": resource,
+					"action":      make(fiber.Map),
+				}
+			}
+
+			// Dynamically add the action
+			permissionMap[resource]["action"].(fiber.Map)[action] = true
+		}
+	}
+
+	// Convert map to slice
+	var permissions []fiber.Map
+	for _, perm := range permissionMap {
+		permissions = append(permissions, perm)
+	}
+
+	// Add Casbin rules (v1, v2) to response
+	var casbinRules []fiber.Map
+	for _, policy := range allPolicies {
+		if len(policy) >= 2 {
+			casbinRules = append(casbinRules, fiber.Map{
+				"v1": policy[1], // Subject or role
+				"v2": policy[2], // Resource
+			})
+		}
+	}
+
+	// Return the token along with permissions and RDP
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{
+		"statusCode": fiber.StatusOK,
+		"data": fiber.Map{
+			"token":       token,
+			"permissions": permissions,
+			"rpd":         rdp,
+			"rules":       casbinRules,
+		},
+		"message": "Login successful",
+	})
+}
+
+func GetUserData(c *fiber.Ctx) error {
+	username := c.Locals("username").(string)
+	// Use the fully qualified function name if it's in another package
+	userData, err := services.GetUserByUsername(username)
+	if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"statusCode": fiber.StatusNotFound,
+			"message":    "User not found",
+			"data":       nil,
+		})
+	}
+
+	return c.JSON(fiber.Map{
+		"statusCode": fiber.StatusOK,
+		"message":    "User data retrieved successfully",
+		"data":       userData,
+	})
+}
+
+// GetUserDataAdmin retrieves user data if the user has admin access
+// func GetUserDataAdmin(c *fiber.Ctx) error {
+// 	// Get the username from the context (set by the JWT middleware)
+// 	username := c.Locals("username").(string)
+
+// 	// Get the Casbin enforcer
+// 	enforcer := helpers.GetCasbinEnforcer()
+
+// 	// Check if the user has access to the "/admin" resource using the "GET" action
+// 	hasAccess, err := enforcer.Enforce(username, "/admin", "GET")
+// 	if err != nil {
+// 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+// 			"statusCode": fiber.StatusInternalServerError,
+// 			"message":    "Failed to check access.",
+// 		})
+// 	}
+
+// 	if !hasAccess {
+// 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+// 			"statusCode": fiber.StatusForbidden,
+// 			"message":    "Forbidden: You don't have access to this resource",
+// 		})
+// 	}
+
+// 	// Fetch user data after access is granted
+// 	userData, err := services.GetUserByUsername(username)
+// 	if err != nil {
+// 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+// 			"statusCode": fiber.StatusNotFound,
+// 			"message":    "User not found",
+// 			"data":       nil,
+// 		})
+// 	}
+
+// 	// Return user data on success
+// 	return c.JSON(fiber.Map{
+// 		"statusCode": fiber.StatusOK,
+// 		"message":    "User data retrieved successfully",
+// 		"data":       userData,
+// 	})
+// }
+
+func Register(c *fiber.Ctx) error {
+	var req dto.RegisterRequest
+
+	// body := c.Body()
+
+	// Parse and validate the request body
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"statusCode": fiber.StatusBadRequest,
+			"data":       nil,
+			"message":    "Invalid input",
+		})
+	}
+
+	// Call the Register service to create the new user
+	response, err := services.Register(req)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"statusCode": fiber.StatusInternalServerError,
+			"data":       nil,
+			"message":    err.Error(),
+		})
+	}
+
+	// Assign the user a role in the Casbin rule table
+	if err := services.AssignUserRole(req.Username); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"statusCode": fiber.StatusInternalServerError,
+			"data":       nil,
+			"message":    "User created, but failed to assign role",
+		})
+	}
+
+	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
+		"statusCode": fiber.StatusCreated,
+		"data":       response,
+		"message":    "User registered successfully",
+	})
+}
+
+// ForgotPasswordHandler handles the request to initiate the password reset process
+func ForgotPasswordHandler(c *fiber.Ctx) error {
+	var req dto.ForgotPasswordRequest
+
+	// Parse the email from the request body
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"statusCode": fiber.StatusBadRequest,
+			"message":    "Cannot parse JSON",
+		})
+	}
+
+	// Call the ForgotPassword service
+	if err := services.ForgotPassword(req.Email); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"statusCode": fiber.StatusInternalServerError,
+			"message":    err.Error(),
+		})
+	}
+
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{
+		"statusCode": fiber.StatusOK,
+		"message":    "Password reset email sent",
+	})
+}
+
+// ResetPasswordHandler handles the request to reset the password
+func ResetPasswordHandler(c *fiber.Ctx) error {
+	var req dto.ResetPasswordRequest
+
+	// Parse the reset token and new password from the request body
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"statusCode": fiber.StatusBadRequest,
+			"message":    "Cannot parse JSON",
+		})
+	}
+
+	// Call the ResetPassword service
+	if err := services.ResetPassword(req.Token, req.NewPassword); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"statusCode": fiber.StatusInternalServerError,
+			"message":    err.Error(),
+		})
+	}
+
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{
+		"statusCode": fiber.StatusOK,
+		"message":    "Password updated successfully",
+	})
+}
+
+// GetAllUsersPaginated handles fetching paginated users
+func GetAllUsersPaginated(ctx *fiber.Ctx) error {
+	// Get the username from the context (set by the JWT middleware)
+	username := ctx.Locals("username").(string)
+
+	// Get the Casbin enforcer
+	enforcer := helpers.GetCasbinEnforcer()
+
+	// Check if the user has access to the "users" resource using the "GET" action
+	hasAccess, err := enforcer.Enforce(username, "users", "read", "none", "none", "none")
+	if err != nil {
+		return ctx.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"statusCode": fiber.StatusInternalServerError,
+			"message":    "Failed to check access.",
+		})
+	}
+
+	if !hasAccess {
+		return ctx.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"statusCode": fiber.StatusForbidden,
+			"message":    "Forbidden: You don't have access to this resource",
+		})
+	}
+
+	// Default query parameters for pagination
+	perPageStr := ctx.Query("perPage", ctx.Query("pageSize", "10"))
+	pageStr := ctx.Query("currentPage", "0")
+	sortBy := ctx.Query("sortBy", "id")           // Default sort by "id"
+	sortDescStr := ctx.Query("sortDesc", "false") // Default sort in ascending order
+	role := ctx.Query("role", "")
+	email := ctx.Query("search", "")
+	// Convert the query parameters to integers
+	perPage, err := strconv.Atoi(perPageStr)
+	if err != nil {
+		return ctx.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"statusCode": fiber.StatusBadRequest,
+			"message":    "Invalid perPage value",
+		})
+	}
+
+	page, err := strconv.Atoi(pageStr)
+	if err != nil {
+		return ctx.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"statusCode": fiber.StatusBadRequest,
+			"message":    "Invalid page value",
+		})
+	}
+
+	sortDesc, err := strconv.ParseBool(sortDescStr)
+	if err != nil {
+		return ctx.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"statusCode": fiber.StatusBadRequest,
+			"message":    "Invalid sortDesc value",
+		})
+	}
+
+	// Call the service to get paginated users
+	users, paginationData, err := services.GetUsersPaginated(perPage, page, sortBy, sortDesc, role, email)
+	if err != nil {
+		return ctx.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"statusCode": fiber.StatusInternalServerError,
+			"message":    "Failed to fetch users",
+		})
+	}
+
+	// Return the paginated data with a success response
+	return ctx.Status(fiber.StatusOK).JSON(fiber.Map{
+		"statusCode":      fiber.StatusOK,
+		"message":         "Users fetched successfully",
+		"data":            users,
+		"pagination_data": paginationData, // Contains current_page, total_pages, etc.
+	})
+}
+
+// GetUserDetailByUUID handles the request to get user detail by UUID with Casbin rules (ptype g) included
+func GetUserDetailByUUID(c *fiber.Ctx) error {
+	// Get UUID from the route parameter
+	userUUID := c.Params("uuid")
+
+	// Get the username of the requester from the context (set by JWT middleware)
+	requesterUsername := c.Locals("username").(string)
+
+	// Get Casbin enforcer
+	enforcer := helpers.GetCasbinEnforcer()
+
+	// Check if the requester has access to view the specific user's details
+	hasAccess, err := enforcer.Enforce(requesterUsername, "users", "read", "none", "none", "none")
+	if err != nil {
+		log.Printf("Error checking Casbin permissions: %v", err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"statusCode": fiber.StatusInternalServerError,
+			"message":    "Failed to check access permissions.",
+		})
+	}
+
+	// If the requester doesn't have access, return a forbidden status
+	if !hasAccess {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"statusCode": fiber.StatusForbidden,
+			"message":    "Forbidden: You don't have permission to access this resource.",
+		})
+	}
+
+	// Call the service to get user data by UUID using UserByAdmin model
+	userData, err := services.GetUserByUUID(userUUID)
+	if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"statusCode": fiber.StatusNotFound,
+			"message":    err.Error(),
+		})
+	}
+
+	// Retrieve the username associated with the user data
+	targetUsername := userData.Username
+
+	// Fetch Casbin policies related to the user (ptype "g", which indicates roles)
+	userRoles, err := enforcer.GetFilteredGroupingPolicy(0, targetUsername) // Grouping policies (ptype "g")
+	if err != nil {
+		log.Printf("Error fetching Casbin policies for user %s: %v", targetUsername, err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"statusCode": fiber.StatusInternalServerError,
+			"message":    "Failed to fetch user roles.",
+		})
+	}
+
+	// Structure the roles with username and role
+	var detailedRoles []fiber.Map
+	for _, role := range userRoles {
+		if len(role) >= 2 { // Ensure that we have both username and role
+			detailedRoles = append(detailedRoles, fiber.Map{
+				"username": role[0],
+				"role":     role[1],
+			})
+		}
+	}
+
+	// Structure the response to include both user data and Casbin rules (ptype "g")
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{
+		"statusCode": fiber.StatusOK,
+		"message":    "User data retrieved successfully",
+		"data": fiber.Map{
+			"user":  userData,      // User data
+			"roles": detailedRoles, // Detailed Casbin roles (username and role)
+		},
+	})
+}
+
+// AddUserRoleByUUIDHandler handles the request to add a role to a user using UUID
+func AddUserRoleByUUIDHandler(c *fiber.Ctx) error {
+	// Get the username of the requester from the context (set by JWT middleware)
+	requesterUsername := c.Locals("username").(string)
+
+	// Get Casbin enforcer
+	enforcer := helpers.GetCasbinEnforcer()
+
+	// Check if the requester has access to view the specific user's details
+	hasAccess, err := enforcer.Enforce(requesterUsername, "users", "create", "none", "none", "none")
+	if err != nil {
+		log.Printf("Error checking Casbin permissions: %v", err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"statusCode": fiber.StatusInternalServerError,
+			"message":    "Failed to check access permissions.",
+		})
+	}
+
+	// If the requester doesn't have access, return a forbidden status
+	if !hasAccess {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"statusCode": fiber.StatusForbidden,
+			"message":    "Forbidden: You don't have permission to access this resource.",
+		})
+	}
+	// Get UUID from the route parameter
+	userUUID := c.Params("uuid")
+
+	// Get role from the request body
+	var req struct {
+		Role string `json:"role_guard_name"`
+	}
+
+	// Parse the request body
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"statusCode": fiber.StatusBadRequest,
+			"message":    "Invalid input",
+		})
+	}
+
+	// Check if role_guard_name is provided
+	if req.Role == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"statusCode": fiber.StatusBadRequest,
+			"message":    "role_guard_name is required",
+		})
+	}
+
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"statusCode": fiber.StatusBadRequest,
+			"message":    "Invalid input",
+		})
+	}
+
+	// Call the service to add the role to the user by UUID
+	err = services.AddUserRoleByUUID(userUUID, req.Role)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"statusCode": fiber.StatusBadRequest,
+			"message":    err.Error(),
+		})
+	}
+
+	// Return success if the role was added
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{
+		"statusCode": fiber.StatusOK,
+		"message":    "Role added successfully",
+	})
+}
+
+// DeleteUserRoleByUUIDHandler handles the request to delete a role from a user using UUID
+func DeleteUserRoleByUUIDHandler(c *fiber.Ctx) error {
+	requesterUsername := c.Locals("username").(string)
+
+	// Get Casbin enforcer
+	enforcer := helpers.GetCasbinEnforcer()
+
+	// Check if the requester has access to view the specific user's details
+	hasAccess, err := enforcer.Enforce(requesterUsername, "users", "delete", "none", "none", "none")
+	if err != nil {
+		log.Printf("Error checking Casbin permissions: %v", err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"statusCode": fiber.StatusInternalServerError,
+			"message":    "Failed to check access permissions.",
+		})
+	}
+
+	// If the requester doesn't have access, return a forbidden status
+	if !hasAccess {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"statusCode": fiber.StatusForbidden,
+			"message":    "Forbidden: You don't have permission to access this resource.",
+		})
+	}
+	// Get UUID from the route parameter
+	userUUID := c.Params("uuid")
+
+	// Get role_guard_name from the request body
+	var req struct {
+		RoleGuardName string `json:"role_guard_name"`
+	}
+
+	// Parse the request body
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"statusCode": fiber.StatusBadRequest,
+			"message":    "Invalid input",
+		})
+	}
+
+	// Check if role_guard_name is provided
+	if req.RoleGuardName == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"statusCode": fiber.StatusBadRequest,
+			"message":    "role_guard_name is required",
+		})
+	}
+
+	// Call the service to delete the role from the user by UUID
+	err = services.DeleteUserRoleByUUID(userUUID, req.RoleGuardName)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"statusCode": fiber.StatusBadRequest,
+			"message":    err.Error(),
+		})
+	}
+
+	// Return success if the role was deleted
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{
+		"statusCode": fiber.StatusOK,
+		"message":    "Role deleted successfully",
+	})
+}
+
+// CreateUserByAdminHandler handles the request from an admin to create a user with a specific role
+func CreateUserByAdminHandler(c *fiber.Ctx) error {
+	requesterUsername := c.Locals("username").(string)
+
+	// Get Casbin enforcer
+	enforcer := helpers.GetCasbinEnforcer()
+
+	// Check if the requester has access to view the specific user's details
+	hasAccess, err := enforcer.Enforce(requesterUsername, "users", "create", "none", "none", "none")
+	if err != nil {
+		log.Printf("Error checking Casbin permissions: %v", err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"statusCode": fiber.StatusInternalServerError,
+			"message":    "Failed to check access permissions.",
+		})
+	}
+
+	// If the requester doesn't have access, return a forbidden status
+	if !hasAccess {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"statusCode": fiber.StatusForbidden,
+			"message":    "Forbidden: You don't have permission to access this resource.",
+		})
+	}
+	var reqAdmin dto.RegisterRequestAdmin
+
+	// Parse the request body
+	if err := c.BodyParser(&reqAdmin); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"statusCode": fiber.StatusBadRequest,
+			"message":    "Invalid request payload",
+		})
+	}
+
+	// Validate the request body
+	if err := helpers.ValidateStruct(&reqAdmin); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"statusCode": fiber.StatusBadRequest,
+			"message":    err.Error(), // This will return detailed validation error message
+		})
+	}
+
+	// Buat objek RegisterRequest dari RegisterRequestAdmin
+	req := dto.RegisterRequest{
+		Fullname: reqAdmin.Fullname,
+		Username: reqAdmin.Username,
+		Password: reqAdmin.Password,
+		Mobile:   reqAdmin.Mobile,
+		Email:    reqAdmin.Email,
+	}
+
+	// Get the role_guard_name from the request body
+	roleGuardName := reqAdmin.RoleGuardName
+	if roleGuardName == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"statusCode": fiber.StatusBadRequest,
+			"message":    "Role guard name is required",
+		})
+	}
+
+	// Call the service to create the user and assign the role
+	response, err := services.CreateUserByAdmin(req, roleGuardName)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"statusCode": fiber.StatusInternalServerError,
+			"message":    err.Error(),
+		})
+	}
+
+	enforcer = helpers.GetCasbinEnforcer()
+	err = enforcer.LoadPolicy()
+	if err != nil {
+		log.Fatalf("Failed to load Casbin policies: %v", err)
+	}
+
+	// Return success response
+	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
+		"statusCode": fiber.StatusCreated,
+		"message":    "User created successfully",
+		"data":       response,
+	})
+}
+
+// ChangePasswordController handles the request to change a user's password
+func ChangePasswordController(c *fiber.Ctx) error {
+	// Ambil username dari konteks (misalnya dari token JWT yang sudah di-decode)
+	username := c.Locals("username").(string)
+
+	// Deklarasikan variabel untuk menampung request payload
+	var req services.ChangePasswordRequest
+
+	// Parse dan validasi request payload
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"statusCode": fiber.StatusBadRequest,
+			"message":    "Invalid request payload",
+		})
+	}
+
+	// Panggil service untuk mengubah password pengguna
+	err := services.ChangePassword(username, req)
+	if err != nil {
+		// Periksa jenis error dan sesuaikan pesan respons
+		if err.Error() == "user not found" {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+				"statusCode": fiber.StatusNotFound,
+				"message":    "User not found",
+			})
+		}
+		if err.Error() == "old password is incorrect" {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"statusCode": fiber.StatusUnauthorized,
+				"message":    "Old password is incorrect",
+			})
+		}
+		if err.Error() == "new password and confirm password do not match" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"statusCode": fiber.StatusBadRequest,
+				"message":    "New password and confirm password do not match",
+			})
+		}
+		// Jika error lain, kembalikan respons 500 (Internal Server Error)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"statusCode": fiber.StatusInternalServerError,
+			"message":    "Failed to update password",
+		})
+	}
+
+	// Kembalikan respons sukses jika password berhasil diubah
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{
+		"statusCode": fiber.StatusOK,
+		"message":    "Password updated successfully",
+	})
+}
+
+func GetUserDetailController(c *fiber.Ctx) error {
+	// Ambil username dari konteks (misalnya dari token JWT yang sudah di-decode)
+	username := c.Locals("username").(string)
+
+	// Panggil service untuk mengambil detail pengguna berdasarkan username
+	response, err := services.GetUserDetail(username)
+	if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"statusCode": fiber.StatusNotFound,
+			"message":    "User not found",
+		})
+	}
+
+	// Kembalikan respons yang berhasil dengan data pengguna
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{
+		"statusCode": fiber.StatusOK,
+		"message":    "User detail retrieved successfully",
+		"data":       response,
+	})
+}
+
+// UpdateUserProfileController handles the request to update a user's profile
+func UpdateUserProfileController(c *fiber.Ctx) error {
+	// Ambil username dari konteks (misalnya dari token JWT atau konteks yang diset sebelumnya)
+	username := c.Locals("username").(string)
+
+	// Deklarasikan variabel untuk menampung request payload
+	var req dto.UpdateUserRequest
+
+	// Parse dan validasi request payload
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"statusCode": fiber.StatusBadRequest,
+			"message":    "Invalid request payload",
+		})
+	}
+
+	// Panggil service untuk memperbarui profil pengguna
+	response, err := services.UpdateUserProfile(username, req)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"statusCode": fiber.StatusInternalServerError,
+			"message":    err.Error(),
+		})
+	}
+
+	// Kembalikan respons yang berhasil jika update sukses
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{
+		"statusCode": fiber.StatusOK,
+		"message":    "User profile updated successfully",
+		"data":       response,
+	})
+}
+
+// UpdateUserByAdminHandler handles the request to update user details by admin
+func UpdateUserByAdminHandler(c *fiber.Ctx) error {
+	requesterUsername := c.Locals("username").(string)
+
+	// Get Casbin enforcer
+	enforcer := helpers.GetCasbinEnforcer()
+
+	// Check if the requester has access to view the specific user's details
+	hasAccess, err := enforcer.Enforce(requesterUsername, "users", "update", "none", "none", "none")
+	if err != nil {
+		log.Printf("Error checking Casbin permissions: %v", err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"statusCode": fiber.StatusInternalServerError,
+			"message":    "Failed to check access permissions.",
+		})
+	}
+
+	// If the requester doesn't have access, return a forbidden status
+	if !hasAccess {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"statusCode": fiber.StatusForbidden,
+			"message":    "Forbidden: You don't have permission to access this resource.",
+		})
+	}
+	var req dto.UpdateUserRequest
+
+	// Parse the request body
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"statusCode": fiber.StatusBadRequest,
+			"message":    "Invalid request payload",
+		})
+	}
+
+	// Validate the request body
+	if err := helpers.ValidateStruct(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"statusCode": fiber.StatusBadRequest,
+			"message":    err.Error(),
+		})
+	}
+
+	// Get the UUID from the route parameter
+	userUUID := c.Params("uuid")
+
+	// Get role_guard_name from the request body
+	var roleReq struct {
+		RoleGuardName string `json:"role_guard_name"`
+	}
+	if err := c.BodyParser(&roleReq); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"statusCode": fiber.StatusBadRequest,
+			"message":    "Invalid request for role_guard_name",
+		})
+	}
+
+	// Call the service to update the user
+	response, err := services.UpdateUserByAdmin(userUUID, req, roleReq.RoleGuardName)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"statusCode": fiber.StatusInternalServerError,
+			"message":    err.Error(),
+		})
+	}
+
+	enforcer = helpers.GetCasbinEnforcer()
+	enforcer.LoadPolicy()
+
+	// Return success response
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{
+		"statusCode": fiber.StatusOK,
+		"message":    "User updated successfully",
+		"data":       response,
+	})
+}
+
+// DeleteUserByAdminHandler handles the request to delete a user by admin
+func DeleteUserByAdminHandler(c *fiber.Ctx) error {
+	requesterUsername := c.Locals("username").(string)
+
+	// Get Casbin enforcer
+	enforcer := helpers.GetCasbinEnforcer()
+
+	// Check if the requester has access to view the specific user's details
+	hasAccess, err := enforcer.Enforce(requesterUsername, "users", "delete", "none", "none", "none")
+	if err != nil {
+		log.Printf("Error checking Casbin permissions: %v", err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"statusCode": fiber.StatusInternalServerError,
+			"message":    "Failed to check access permissions.",
+		})
+	}
+
+	// If the requester doesn't have access, return a forbidden status
+	if !hasAccess {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"statusCode": fiber.StatusForbidden,
+			"message":    "Forbidden: You don't have permission to access this resource.",
+		})
+	}
+	// Get the UUID from the route parameter
+	userUUID := c.Params("uuid")
+
+	// Call the service to delete the user
+	err = services.DeleteUserByAdmin(userUUID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"statusCode": fiber.StatusInternalServerError,
+			"message":    err.Error(),
+		})
+	}
+
+	// Return success response
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{
+		"statusCode": fiber.StatusOK,
+		"message":    "User deleted successfully",
+	})
+}
+
+// ActivateUserHandler handles the request to activate a user
+func ActivateUserHandler(c *fiber.Ctx) error {
+	requesterUsername := c.Locals("username").(string)
+
+	// Get Casbin enforcer
+	enforcer := helpers.GetCasbinEnforcer()
+
+	// Check if the requester has access to view the specific user's details
+	hasAccess, err := enforcer.Enforce(requesterUsername, "users", "update", "none", "none", "none")
+	if err != nil {
+		log.Printf("Error checking Casbin permissions: %v", err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"statusCode": fiber.StatusInternalServerError,
+			"message":    "Failed to check access permissions.",
+		})
+	}
+
+	// If the requester doesn't have access, return a forbidden status
+	if !hasAccess {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"statusCode": fiber.StatusForbidden,
+			"message":    "Forbidden: You don't have permission to access this resource.",
+		})
+	}
+	// Get the UUID from the route parameter
+	userUUID := c.Params("uuid")
+
+	// Call the service to activate the user
+	err = services.ActivateUser(userUUID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"statusCode": fiber.StatusInternalServerError,
+			"message":    err.Error(),
+		})
+	}
+
+	// Return success response
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{
+		"statusCode": fiber.StatusOK,
+		"message":    "User activated successfully",
+	})
+}
+
+// ActivateUserHandler handles the request to activate a user
+func DeactivateUserHandler(c *fiber.Ctx) error {
+	requesterUsername := c.Locals("username").(string)
+
+	// Get Casbin enforcer
+	enforcer := helpers.GetCasbinEnforcer()
+
+	// Check if the requester has access to view the specific user's details
+	hasAccess, err := enforcer.Enforce(requesterUsername, "users", "update", "none", "none", "none")
+	if err != nil {
+		log.Printf("Error checking Casbin permissions: %v", err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"statusCode": fiber.StatusInternalServerError,
+			"message":    "Failed to check access permissions.",
+		})
+	}
+
+	// If the requester doesn't have access, return a forbidden status
+	if !hasAccess {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"statusCode": fiber.StatusForbidden,
+			"message":    "Forbidden: You don't have permission to access this resource.",
+		})
+	}
+	// Get the UUID from the route parameter
+	userUUID := c.Params("uuid")
+
+	// Call the service to activate the user
+	err = services.DeactivateUser(userUUID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"statusCode": fiber.StatusInternalServerError,
+			"message":    err.Error(),
+		})
+	}
+
+	// Return success response
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{
+		"statusCode": fiber.StatusOK,
+		"message":    "User Deactivated successfully",
+	})
+}

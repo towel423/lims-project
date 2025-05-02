@@ -1,0 +1,15 @@
+version: "3"
+
+services:
+  lims-frontend-staging:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lims-frontend-staging
+    ports:
+      - "1003:3000"
+    environment:
+      - NODE_ENV=production
+    volumes:
+      - .:/app
+    #command: npm run start

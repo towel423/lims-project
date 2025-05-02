@@ -1,0 +1,97 @@
+import React from "react";
+import { Navigation, Pagination, Autoplay } from "swiper/modules";
+import { Swiper, SwiperSlide } from "swiper/react";
+import "swiper/css";
+import "swiper/css/navigation";
+import "swiper/css/pagination";
+import "swiper/css/scrollbar";
+import { Box } from "@mui/material";
+import { useBannerTable } from "../../../hooks/data/useBannerData";
+import { IBanner } from "../../../interface/admin/banner";
+export default function AdminDashboardBanner() {
+  const { data } = useBannerTable();
+  return (
+    <Box
+      sx={{
+        position: "relative",
+        px: 2, // Padding X
+        py: 2, // Padding Y
+        my: "auto",
+        marginTop: "75px",
+        marginBottom: "1rem",
+        display: "flex",
+      }}
+    >
+      <Swiper
+        modules={[Autoplay, Pagination, Navigation]}
+        spaceBetween={20} // Spacing between slides
+        slidesPerView={1} // Default: 1 slide per view
+        loop={true} // Infinite loop
+        pagination={{ clickable: true }} // Dots
+        navigation={true} // Arrows
+        autoplay={{
+          delay: 4000,
+          pauseOnMouseEnter: true,
+          disableOnInteraction: false,
+        }}
+        breakpoints={{
+          640: {
+            slidesPerView: 1,
+            spaceBetween: 20,
+          },
+          768: {
+            slidesPerView: 1,
+            spaceBetween: 30,
+          },
+          1024: {
+            slidesPerView: 1,
+            spaceBetween: 50,
+          },
+        }}
+        style={{ width: "100%" }}
+      >
+        {data?.data &&
+          data?.data.map((row: IBanner) => (
+            <SwiperSlide key={row.id}>
+              <Box
+                component="a"
+                href="/"
+                target="_blank"
+                rel="noopener noreferrer"
+                sx={{
+                  textDecoration: "none",
+                  outline: "none",
+                }}
+              >
+                <Box
+                  sx={{
+                    position: "relative",
+                    width: "100%",
+                    aspectRatio: "16/6", // Maintain 16:6 aspect ratio
+                    overflow: "hidden",
+                    borderRadius: 3, // Rounded corners (equivalent to rounded-3xl)
+                  }}
+                >
+                  <img
+                    decoding="async"
+                    data-nimg="fill"
+                    className="rounded-3xl object-cover w-full h-full"
+                    sizes="100vw"
+                    src={row.image_url}
+                    style={{
+                      position: "absolute",
+                      height: "100%",
+                      width: "100%",
+                      inset: 0,
+                      color: "transparent",
+                    }}
+                    alt="Slide image"
+                  />
+                </Box>
+              </Box>
+            </SwiperSlide>
+          ))}
+      </Swiper>
+    </Box>
+  );
+}

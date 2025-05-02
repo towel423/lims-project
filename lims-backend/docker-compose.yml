@@ -1,0 +1,10 @@
+version: "3.8"
+services:
+  lims-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./:/app
+    ports:
+      - "4001:3000"

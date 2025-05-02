@@ -1,0 +1,22 @@
+# Config file for Air
+# see https://github.com/cosmtrek/air for more examples
+
+[build]
+cmd = "go build -o ./tmp/main ."
+bin = "tmp/main"
+full_bin = "APP_ENV=dev ./tmp/main"
+include_ext = ["go", "tpl", "html"]
+exclude_dir = ["assets", "tmp"]
+exclude_file = []
+follow_symlink = true
+force_polling = false
+poll_interval = 1000
+# These log settings
+# are useful for debugging
+[log]
+level = "debug"
+[color]
+main = "magenta"
+watcher = "cyan"
+build = "yellow"
+runner = "green"
