@@ -1,0 +1,9 @@
+PORT=3100
+STORAGE_PATH=./storage/
+PUBLIC_URL=http://localhost:3100/generated-files/
+
+DB_USER=postgres
+DB_PASSWORD=passwordku
+DB_NAME=object-storage
+DB_HOST=103.127.135.228
+DB_PORT=5432

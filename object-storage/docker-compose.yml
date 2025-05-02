@@ -1,0 +1,17 @@
+version: "3.8"
+
+services:
+  object-storage:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./:/app
+    ports:
+      - "3100:3000"
+    networks:
+      - mui-network
+
+networks:
+  mui-network:
+    driver: bridge
